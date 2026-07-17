@@ -6,6 +6,8 @@ GameDay Mirror turns a laptop or phone camera into a personal pre-training stati
 
 This is not a chatbot placed over a video feed. It is a multimodal coaching workflow that combines live audio, computer vision, memory, structured data, and agent-generated recommendations.
 
+**Live demo:** [i87d4gcb.insforge.site](https://i87d4gcb.insforge.site)
+
 ## The Problem
 
 Most athletes train without daily access to a coach. Even when a coach is available, important context is scattered across messages, wearable dashboards, training logs, and memory. A generic recovery score also cannot explain *why* an athlete feels different or show whether movement quality has changed.
@@ -206,6 +208,26 @@ npm run dev:agent  # Start the LiveKit/ElevenLabs worker
 npm run lint       # Type-check the React application
 npm run build      # Build the production web bundle
 npm test           # Run the Python test suite
+```
+
+## InsForge Deployment
+
+The production app uses three InsForge-managed deployments:
+
+- `apps/web/` is hosted as the public Vite application through InsForge Deployments.
+- `gameday-mirror-api` runs the FastAPI orchestrator on InsForge Compute.
+- `gameday-mirror-agent` runs the LiveKit/ElevenLabs worker on InsForge Compute.
+
+The root `Dockerfile` selects the API or worker process through `SERVICE_ROLE`. Frontend hosting reads `VITE_API_BASE_URL` from persistent InsForge deployment variables. Compute credentials remain encrypted server-side and are never bundled into the web application.
+
+```bash
+# Deploy the frontend after setting its public API URL
+npx @insforge/cli deployments env set VITE_API_BASE_URL https://your-api.example.com
+npx @insforge/cli deployments deploy apps/web
+
+# Inspect production resources
+npx @insforge/cli deployments list
+npx @insforge/cli compute list
 ```
 
 ## Current Scope and Safety

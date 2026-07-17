@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+.venv
+.insforge
+.playwright-cli
+.pytest_cache
+node_modules
+dist
+apps/web/dist
+__pycache__
+*.pyc
+*.log
