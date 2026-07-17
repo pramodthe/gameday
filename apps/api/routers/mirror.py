@@ -10,20 +10,20 @@ from fastapi import APIRouter, HTTPException
 from livekit.api import AccessToken, RoomAgentDispatch, RoomConfiguration, VideoGrants
 from pydantic import BaseModel, Field
 
+from gameday_mirror.checkin import CATEGORIES, checkin_complete
 from gameday_mirror.persistence import complete_session, ensure_session, record_answer, record_movement_analysis
+from gameday_mirror.lessons import generate_exercise_lesson
 from gameday_mirror.sponsors import generate_plan, retrieve_memories, store_memory, validate_plan
 from gameday_mirror.vision import analyze_movement, fallback_analysis
 
 router = APIRouter(prefix="/api/mirror", tags=["mirror"])
 
-CATEGORIES = ("sleep", "training", "fuel", "spending")
-
 
 class MirrorAnswerIn(BaseModel):
     room_name: str = Field(min_length=1, max_length=128)
-    category: Literal["sleep", "training", "fuel", "spending"]
+    category: Literal["sleep", "recovery", "training", "fuel", "mindset", "spending"]
     transcript: str = Field(min_length=1, max_length=2000)
-    answers: list[dict[str, str]] = Field(default_factory=list, max_length=4)
+    answers: list[dict[str, str]] = Field(default_factory=list, max_length=len(CATEGORIES))
 
 
 class MovementAnalysisIn(BaseModel):
@@ -31,6 +31,10 @@ class MovementAnalysisIn(BaseModel):
     movement: Literal["squat"] = "squat"
     image_data_url: str = Field(min_length=100, max_length=2_500_000)
     pose_metrics: dict[str, float] = Field(default_factory=dict)
+
+
+class ExerciseLessonIn(BaseModel):
+    exercise_name: str = Field(min_length=2, max_length=80)
 
 
 def _livekit_settings() -> tuple[str, str, str, str]:
@@ -85,6 +89,18 @@ def _metric(category: str, transcript: str) -> dict[str, Any]:
             "unit": "hours",
             "confidence": 0.92 if numeric is not None else 0.58,
         }
+    if category == "recovery":
+        low = any(word in lowered for word in ("sore", "ache", "tired", "fatigue", "stiff", "heavy", "exhausted"))
+        pct = numeric if (numeric is not None and numeric <= 100) else (45.0 if low else 78.0)
+        return {
+            "key": "recovery",
+            "numeric_value": pct,
+            "display_value": f"{pct:g}%",
+            "status": "attention" if pct < 60 or low else "good",
+            "detail": "Recovery needs attention" if pct < 60 or low else "Recovery on track",
+            "unit": "percent",
+            "confidence": 0.8 if (numeric is not None or low) else 0.55,
+        }
     if category == "training":
         skipped = any(word in lowered for word in ("rest", "off", "none", "no training"))
         return {
@@ -107,6 +123,17 @@ def _metric(category: str, transcript: str) -> dict[str, Any]:
             "unit": "signal",
             "confidence": 0.86,
         }
+    if category == "mindset":
+        strained = any(word in lowered for word in ("stress", "nervous", "anxious", "unfocused", "distracted", "worried"))
+        return {
+            "key": "mindset",
+            "numeric_value": 0 if strained else 1,
+            "display_value": "Strained" if strained else "Focused",
+            "status": "attention" if strained else "good",
+            "detail": "Reset focus before load" if strained else "Clear accountability target",
+            "unit": "signal",
+            "confidence": 0.78,
+        }
     amount = numeric if numeric is not None else 0
     return {
         "key": "spending",
@@ -117,6 +144,22 @@ def _metric(category: str, transcript: str) -> dict[str, Any]:
         "unit": "usd",
         "confidence": 0.88 if numeric is not None else 0.65,
     }
+
+
+def _memory_summary(answers: list[dict[str, str]], actions: list[dict[str, str]]) -> str:
+    """A meaningful, offline-safe recap of the session for semantic recall."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    parts: list[str] = []
+    for answer in answers:
+        category = str(answer.get("category") or "").strip()
+        transcript = str(answer.get("transcript") or "").strip()
+        if not category or not transcript:
+            continue
+        metric = _metric(category, transcript)
+        parts.append(f"{category} {metric['display_value']} ({metric['status']})")
+    readiness = "; ".join(parts) if parts else "no readiness answers captured"
+    focus = actions[0].get("title") if actions else "recovery-first"
+    return f"{today} · {readiness}. Plan focus: {focus}."
 
 
 @router.get("/config")
@@ -200,6 +243,8 @@ def mirror_answer(body: MirrorAnswerIn) -> dict[str, object]:
         record_answer(body.room_name, category=body.category, transcript=body.transcript, metric=metric)
     except Exception:
         pass
+    captured = {str(answer.get("category") or "") for answer in body.answers} | {body.category}
+    captured.discard("")
     events: list[dict[str, object]] = [
         _event(
             "metric_updated",
@@ -213,11 +258,11 @@ def mirror_answer(body: MirrorAnswerIn) -> dict[str, object]:
         _event(
             "checkin_progressed",
             body.room_name,
-            completed_step=CATEGORIES.index(body.category) + 1,
-            total_steps=4,
+            completed_step=len(captured),
+            total_steps=len(CATEGORIES),
         ),
     ]
-    if body.category != "spending":
+    if not checkin_complete(captured):
         return {"events": events}
 
     profile_id = os.environ.get("INSFORGE_PROFILE_ID", "gameday-demo")
@@ -233,7 +278,7 @@ def mirror_answer(body: MirrorAnswerIn) -> dict[str, object]:
         )
     except Exception:
         streak = 6
-    summary = "Check-in completed with a recovery-first plan and one off-field accountability target."
+    summary = _memory_summary(body.answers, actions)
     store_memory(profile_id, body.room_name, summary, actions)
     if memories:
         events.append(
@@ -280,3 +325,8 @@ async def movement_analysis(body: MovementAnalysisIn) -> dict[str, object]:
     except Exception:
         persisted = False
     return {"analysis": analysis, "persisted": persisted}
+
+
+@router.post("/exercise/lesson")
+async def exercise_lesson(body: ExerciseLessonIn) -> dict[str, object]:
+    return {"lesson": await generate_exercise_lesson(body.exercise_name)}

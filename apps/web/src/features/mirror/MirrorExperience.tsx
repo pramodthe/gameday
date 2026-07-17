@@ -23,10 +23,11 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { CameraBackdrop } from './CameraBackdrop';
+import { ExerciseLessonCard } from './ExerciseLessonCard';
 import { LiveKitCameraBackdrop } from './LiveKitCameraBackdrop';
 import { MovementCoach } from './MovementCoach';
 import { useMirrorSession } from './useMirrorSession';
-import type { LiveMirrorConfig, MetricKey, MirrorMetric } from './types';
+import type { AgUiToolCallEvent, ExerciseEventPublisher, ExerciseLesson, LiveMirrorConfig, LiveMirrorPayload, MetricKey, MirrorMetric } from './types';
 import './mirror.css';
 
 const API_BASE = (import.meta.env.DEV ? '' : (import.meta.env.VITE_API_BASE_URL ?? '')).replace(/\/$/, '');
@@ -48,6 +49,13 @@ const stageLabels = {
   thinking: 'Building context',
   complete: 'Check-in complete',
 };
+
+function isAgUiToolCallEvent(event: LiveMirrorPayload): event is AgUiToolCallEvent {
+  return event.type === 'TOOL_CALL_START'
+    || event.type === 'TOOL_CALL_ARGS'
+    || event.type === 'TOOL_CALL_END'
+    || event.type === 'TOOL_CALL_RESULT';
+}
 
 function MetricRow({ metric, active }: { metric: MirrorMetric; active: boolean }) {
   const Icon = metricIcons[metric.key];
@@ -91,8 +99,12 @@ export function MirrorExperience() {
   const [liveConfig, setLiveConfig] = useState<LiveMirrorConfig>({ configured: false });
   const [liveMode, setLiveMode] = useState(false);
   const [movementMode, setMovementMode] = useState(false);
+  const [exerciseRequestId, setExerciseRequestId] = useState<string>();
+  const [lessonRequest, setLessonRequest] = useState<{ requestId: string; exerciseName: string; lesson?: ExerciseLesson } | null>(null);
   const [cameraVideo, setCameraVideo] = useState<HTMLVideoElement | null>(null);
   const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const exercisePublisherRef = useRef<ExerciseEventPublisher | null>(null);
+  const sharedStateRevisionRef = useRef(-1);
 
   const activeMetric = session.currentQuestion?.id;
   const bodyMetrics = session.metrics.slice(0, 3);
@@ -128,6 +140,7 @@ export function MirrorExperience() {
   }, []);
 
   const requestLiveSession = useCallback(async () => {
+    sharedStateRevisionRef.current = -1;
     session.beginLive();
     try {
       const response = await fetch(`${API_BASE}/api/mirror/token`, { method: 'POST' });
@@ -140,6 +153,76 @@ export function MirrorExperience() {
       session.reset();
     }
   }, [session]);
+
+  const handleLiveEvent = useCallback((event: LiveMirrorPayload) => {
+    if (event.type === 'STATE_SNAPSHOT') {
+      const sharedState = event.snapshot;
+      if (sharedState.revision <= sharedStateRevisionRef.current) return;
+      sharedStateRevisionRef.current = sharedState.revision;
+      const exercise = sharedState.exercise;
+      if (exercise.mode === 'idle') {
+        setLessonRequest(null);
+        setExerciseRequestId(undefined);
+        setMovementMode(false);
+        return;
+      }
+      if (exercise.mode === 'lesson') {
+        setMovementMode(false);
+        setExerciseRequestId(undefined);
+        if (exercise.status === 'closed') {
+          setLessonRequest(null);
+          return;
+        }
+        if (exercise.requestId && exercise.name) {
+          setLessonRequest({
+            requestId: exercise.requestId,
+            exerciseName: exercise.name,
+            lesson: exercise.lesson ?? undefined,
+          });
+        }
+        return;
+      }
+      setLessonRequest(null);
+      if (exercise.status === 'closed') {
+        setMovementMode(false);
+        setExerciseRequestId(undefined);
+        return;
+      }
+      if (exercise.requestId) {
+        setExerciseRequestId(exercise.requestId);
+        setMovementMode(true);
+      }
+      return;
+    }
+    if (isAgUiToolCallEvent(event)) return;
+    if (event.type === 'exercise_requested' && event.exercise === 'squat') {
+      setLessonRequest(null);
+      setExerciseRequestId(event.request_id ?? crypto.randomUUID());
+      setMovementMode(true);
+    }
+    if (event.type === 'exercise_lesson_requested' && event.exercise_name) {
+      setMovementMode(false);
+      setExerciseRequestId(undefined);
+      setLessonRequest({
+        requestId: event.request_id ?? crypto.randomUUID(),
+        exerciseName: event.exercise_name,
+      });
+    }
+    session.applyLiveEvent(event);
+  }, [session]);
+
+  const handleExercisePublisherChange = useCallback((publisher: ExerciseEventPublisher | null) => {
+    exercisePublisherRef.current = publisher;
+  }, []);
+
+  const publishExerciseEvent = useCallback((event: Parameters<ExerciseEventPublisher>[0]) => {
+    if (exercisePublisherRef.current) void exercisePublisherRef.current(event);
+  }, []);
+
+  const closeExercise = useCallback(() => {
+    setMovementMode(false);
+    setExerciseRequestId(undefined);
+  }, []);
 
   const submitDraft = useCallback(() => {
     const answer = draft.trim();
@@ -166,19 +249,21 @@ export function MirrorExperience() {
   };
 
   const progressDots = useMemo(
-    () => Array.from({ length: 4 }, (_, index) => index < session.progress),
-    [session.progress],
+    () => Array.from({ length: session.totalSteps }, (_, index) => index < session.progress),
+    [session.progress, session.totalSteps],
   );
 
   return (
-    <main className="mirror-shell">
+    <main className="mirror-shell" data-movement={movementMode} data-lesson={Boolean(lessonRequest)}>
       <div className="mirror-media">
         {liveMode && liveConfig.token ? (
           <LiveKitCameraBackdrop
             config={liveConfig}
             onConnected={() => session.applyLiveEvent({ type: 'agent_state_changed', state: 'listening' })}
             onDisconnected={() => setLiveMode(false)}
-            onEvent={session.applyLiveEvent}
+            onEvent={handleLiveEvent}
+            controlsHidden={Boolean(lessonRequest)}
+            onExercisePublisherChange={handleExercisePublisherChange}
             onVideoElementChange={setCameraVideo}
           />
         ) : (
@@ -193,8 +278,25 @@ export function MirrorExperience() {
         active={movementMode}
         videoElement={cameraVideo}
         roomName={liveConfig.roomName}
-        onClose={() => setMovementMode(false)}
+        autoStartRequestId={exerciseRequestId}
+        onExerciseEvent={publishExerciseEvent}
+        onClose={closeExercise}
       />
+      <AnimatePresence>
+        {lessonRequest && (
+          <ExerciseLessonCard
+            key={lessonRequest.requestId}
+            request={lessonRequest}
+            onEvent={publishExerciseEvent}
+            onClose={() => setLessonRequest(null)}
+            onPracticeSquat={() => {
+              setLessonRequest(null);
+              setExerciseRequestId(`manual-${crypto.randomUUID()}`);
+              setMovementMode(true);
+            }}
+          />
+        )}
+      </AnimatePresence>
       <div className="mirror-grade" />
       <div className="mirror-grain" />
 
@@ -212,11 +314,17 @@ export function MirrorExperience() {
             type="button"
             className="mirror-mode-pill mirror-vision-pill"
             data-active={movementMode}
-            disabled={!cameraEnabled || !cameraVideo || liveConfig.sponsors?.openai === false}
-            onClick={() => setMovementMode((current) => !current)}
-            title="Run a three-rep AI movement screen"
+            disabled={!cameraEnabled || !cameraVideo}
+            onClick={() => {
+              setLessonRequest(null);
+              setMovementMode((current) => {
+                setExerciseRequestId(current ? undefined : `manual-${crypto.randomUUID()}`);
+                return !current;
+              });
+            }}
+            title="Start a guided camera exercise"
           >
-            <ScanLine size={14} /> {movementMode ? 'Scanning form' : 'Scan movement'}
+            <ScanLine size={14} /> {movementMode ? 'Exercise active' : 'Start exercise'}
           </button>
           <button
             type="button"
@@ -280,9 +388,9 @@ export function MirrorExperience() {
         >
           <div className="mirror-card__heading">
             <span><Sparkles size={17} /> Nova check-in</span>
-            <small>{Math.min(session.progress + (session.stage === 'listening' ? 1 : 0), 4)}/4</small>
+            <small>{Math.min(session.progress + (session.stage === 'listening' ? 1 : 0), session.totalSteps)}/{session.totalSteps}</small>
           </div>
-          <div className="mirror-progress" aria-label={`${session.progress} of 4 questions complete`}>
+          <div className="mirror-progress" aria-label={`${session.progress} of ${session.totalSteps} questions complete`}>
             {progressDots.map((filled, index) => <i key={index} data-filled={filled} />)}
           </div>
 
@@ -317,7 +425,7 @@ export function MirrorExperience() {
             {session.memoryVisible && (
               <motion.div className="mirror-memory" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
                 <span><Brain size={15} /> Memory used</span>
-                <small>Yesterday · 7:42 AM</small>
+                <small>{session.memoryText ?? 'Recalling your last check-in…'}</small>
               </motion.div>
             )}
           </AnimatePresence>

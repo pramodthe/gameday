@@ -10,6 +10,8 @@ from uuid import uuid4
 
 import httpx
 
+EMBED_DIM = 256
+
 DEFAULT_PLAN = [
     {
         "id": "fuel",
@@ -32,7 +34,7 @@ DEFAULT_PLAN = [
 ]
 
 
-def _hash_embedding(text: str, dimensions: int = 64) -> list[float]:
+def _hash_embedding(text: str, dimensions: int = EMBED_DIM) -> list[float]:
     vector = [0.0] * dimensions
     for token in re.findall(r"[a-z0-9]+", text.lower()):
         digest = hashlib.sha256(token.encode()).digest()
@@ -40,6 +42,32 @@ def _hash_embedding(text: str, dimensions: int = 64) -> list[float]:
         vector[index] += -1.0 if digest[4] & 1 else 1.0
     norm = math.sqrt(sum(value * value for value in vector)) or 1.0
     return [value / norm for value in vector]
+
+
+def _embedding(text: str) -> list[float]:
+    """Semantic embedding via OpenAI when configured, else a deterministic hash sketch.
+
+    Both paths return an ``EMBED_DIM``-length vector so the same Qdrant collection
+    accepts either, keeping the demo functional without an API key.
+    """
+    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        return _hash_embedding(text)
+    model = (os.environ.get("OPENAI_EMBEDDING_MODEL") or "text-embedding-3-small").strip()
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.post(
+                "https://api.openai.com/v1/embeddings",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": model, "input": text, "dimensions": EMBED_DIM},
+            )
+            response.raise_for_status()
+            vector = response.json()["data"][0]["embedding"]
+            if isinstance(vector, list) and len(vector) == EMBED_DIM:
+                return [float(value) for value in vector]
+    except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError):
+        pass
+    return _hash_embedding(text)
 
 
 def _qdrant_headers() -> dict[str, str]:
@@ -52,9 +80,9 @@ def retrieve_memories(user_id: str, query: str, *, limit: int = 3) -> list[dict[
     key = (os.environ.get("QDRANT_API_KEY") or "").strip()
     if not (url and key):
         return []
-    collection = os.environ.get("QDRANT_MIRROR_COLLECTION", "gameday_memories")
+    collection = os.environ.get("QDRANT_MIRROR_COLLECTION", "gameday_memories_v2")
     payload = {
-        "query": _hash_embedding(query),
+        "query": _embedding(query),
         "filter": {"must": [{"key": "user_id", "match": {"value": user_id}}]},
         "limit": limit,
         "with_payload": True,
@@ -80,14 +108,20 @@ def store_memory(user_id: str, room_name: str, summary: str, actions: list[dict[
     key = (os.environ.get("QDRANT_API_KEY") or "").strip()
     if not (url and key):
         return False
-    collection = os.environ.get("QDRANT_MIRROR_COLLECTION", "gameday_memories")
+    collection = os.environ.get("QDRANT_MIRROR_COLLECTION", "gameday_memories_v2")
     try:
         with httpx.Client(timeout=10.0) as client:
             client.put(
                 f"{url}/collections/{collection}",
                 headers=_qdrant_headers(),
-                json={"vectors": {"size": 64, "distance": "Cosine"}},
+                json={"vectors": {"size": EMBED_DIM, "distance": "Cosine"}},
             )
+            index_response = client.put(
+                f"{url}/collections/{collection}/index?wait=true",
+                headers=_qdrant_headers(),
+                json={"field_name": "user_id", "field_schema": "keyword"},
+            )
+            index_response.raise_for_status()
             response = client.put(
                 f"{url}/collections/{collection}/points?wait=true",
                 headers=_qdrant_headers(),
@@ -95,7 +129,7 @@ def store_memory(user_id: str, room_name: str, summary: str, actions: list[dict[
                     "points": [
                         {
                             "id": str(uuid4()),
-                            "vector": _hash_embedding(summary),
+                            "vector": _embedding(summary),
                             "payload": {
                                 "user_id": user_id,
                                 "session_id": room_name,

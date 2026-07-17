@@ -12,40 +12,26 @@ function createMessage(speaker: TranscriptMessage['speaker'], text: string): Tra
   };
 }
 
-function speak(text: string): Promise<void> {
-  return new Promise((resolve) => {
-    if (!('speechSynthesis' in window)) {
-      resolve();
-      return;
-    }
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 1.03;
-    utterance.pitch = 0.92;
-    utterance.onend = () => resolve();
-    utterance.onerror = () => resolve();
-    window.speechSynthesis.speak(utterance);
-  });
-}
-
 export function useMirrorSession() {
   const [stage, setStage] = useState<AgentStage>('idle');
   const [questionIndex, setQuestionIndex] = useState(0);
   const [metrics, setMetrics] = useState<MirrorMetric[]>(INITIAL_METRICS);
   const [messages, setMessages] = useState<TranscriptMessage[]>([]);
   const [memoryVisible, setMemoryVisible] = useState(false);
+  const [memoryText, setMemoryText] = useState<string | null>(null);
   const [planVisible, setPlanVisible] = useState(false);
   const [plan, setPlan] = useState(DAILY_PLAN);
   const [streak, setStreak] = useState(5);
+  const [totalSteps, setTotalSteps] = useState(DEMO_QUESTIONS.length);
   const runIdRef = useRef(0);
 
   const currentQuestion = DEMO_QUESTIONS[questionIndex] ?? null;
-  const progress = stage === 'complete' ? DEMO_QUESTIONS.length : questionIndex;
+  const progress = stage === 'complete' ? totalSteps : Math.min(questionIndex, totalSteps);
 
   const say = useCallback(async (text: string, runId: number) => {
     setStage('speaking');
     setMessages((current) => [...current, createMessage('agent', text)]);
-    await speak(text);
+    await wait(700);
     if (runIdRef.current === runId) setStage('listening');
   }, []);
 
@@ -57,6 +43,8 @@ export function useMirrorSession() {
     setQuestionIndex(0);
     setMetrics(INITIAL_METRICS);
     setMemoryVisible(false);
+    setMemoryText(null);
+    setTotalSteps(DEMO_QUESTIONS.length);
     setPlanVisible(false);
     setPlan(DAILY_PLAN);
     setStreak(5);
@@ -95,11 +83,12 @@ export function useMirrorSession() {
 
       setStage('speaking');
       setMessages((current) => [...current, createMessage('agent', currentQuestion.acknowledgement)]);
-      await speak(currentQuestion.acknowledgement);
+      await wait(700);
       if (runIdRef.current !== runId) return;
       setMemoryVisible(true);
+      setMemoryText(MEMORY_TEXT);
       setMessages((current) => [...current, createMessage('agent', MEMORY_TEXT)]);
-      await speak(MEMORY_TEXT);
+      await wait(900);
       if (runIdRef.current !== runId) return;
       setStage('thinking');
       await wait(900);
@@ -113,12 +102,13 @@ export function useMirrorSession() {
 
   const reset = useCallback(() => {
     runIdRef.current += 1;
-    window.speechSynthesis?.cancel();
     setStage('idle');
     setQuestionIndex(0);
     setMetrics(INITIAL_METRICS);
     setMessages([]);
     setMemoryVisible(false);
+    setMemoryText(null);
+    setTotalSteps(DEMO_QUESTIONS.length);
     setPlanVisible(false);
     setPlan(DAILY_PLAN);
     setStreak(5);
@@ -126,12 +116,13 @@ export function useMirrorSession() {
 
   const beginLive = useCallback(() => {
     runIdRef.current += 1;
-    window.speechSynthesis?.cancel();
     setStage('connecting');
     setQuestionIndex(0);
     setMetrics(INITIAL_METRICS);
     setMessages([]);
     setMemoryVisible(false);
+    setMemoryText(null);
+    setTotalSteps(DEMO_QUESTIONS.length);
     setPlanVisible(false);
     setPlan(DAILY_PLAN);
     setStreak(5);
@@ -158,13 +149,18 @@ export function useMirrorSession() {
         return;
       }
       if (event.type === 'checkin_progressed' && event.completed_step !== undefined) {
-        setQuestionIndex(Math.min(event.completed_step, DEMO_QUESTIONS.length));
+        const total = event.total_steps ?? DEMO_QUESTIONS.length;
+        setTotalSteps(total);
+        setQuestionIndex(Math.min(event.completed_step, total));
         return;
       }
       if (event.type === 'memory_used') {
         setMemoryVisible(true);
         const message = event.message;
-        if (message) setMessages((current) => [...current, createMessage('agent', message)]);
+        if (message) {
+          setMemoryText(message);
+          setMessages((current) => [...current, createMessage('agent', message)]);
+        }
         return;
       }
       if (event.type === 'plan_ready' && event.actions?.length) {
@@ -202,8 +198,6 @@ export function useMirrorSession() {
     [questionIndex],
   );
 
-  useEffect(() => () => window.speechSynthesis?.cancel(), []);
-
   return useMemo(
     () => ({
       stage,
@@ -212,9 +206,11 @@ export function useMirrorSession() {
       metrics,
       messages,
       memoryVisible,
+      memoryText,
       planVisible,
       plan,
       progress,
+      totalSteps,
       streak,
       start,
       submitAnswer,
@@ -222,6 +218,6 @@ export function useMirrorSession() {
       applyLiveEvent,
       reset,
     }),
-    [applyLiveEvent, beginLive, currentQuestion, memoryVisible, messages, metrics, plan, planVisible, progress, questionIndex, reset, stage, start, streak, submitAnswer],
+    [applyLiveEvent, beginLive, currentQuestion, memoryText, memoryVisible, messages, metrics, plan, planVisible, progress, questionIndex, reset, stage, start, streak, submitAnswer, totalSteps],
   );
 }
