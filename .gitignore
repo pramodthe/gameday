@@ -1,33 +1,29 @@
-# --- Python ---
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+.env
+.env.local
+.env.*.local
+.codex/config.toml
 .venv/
-venv/
-env/
-
-# --- Node / frontend ---
 node_modules/
 dist/
-dist-ssr/
-*.tsbuildinfo
-.vite/
-
-# --- Env / secrets ---
-.env
-.env.*
-!.env.example
-
-# --- OS / editor ---
+apps/*/dist/
+__pycache__/
+.pytest_cache/
+.playwright-cli/
+*.pyc
+*.egg-info/
 .DS_Store
-Thumbs.db
-*.log
-.idea/
-.vscode/
 
-# --- Misc ---
-*.local
-scratchpad/
+# InsForge & AI agent skills
+.insforge
+.agent
+.agents
+.augment
+.claude
+.cline
+.github/copilot*
+.kilocode
+.qoder
+.qwen
+.roo
+.trae
+.windsurf

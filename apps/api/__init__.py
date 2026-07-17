@@ -1,0 +1,1 @@
+"""GameDay Mirror FastAPI service."""

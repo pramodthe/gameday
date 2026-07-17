@@ -1,0 +1,1 @@
+"""GameDay Mirror service adapters."""

@@ -1,0 +1,20 @@
+{
+  "name": "gameday-mirror",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n web,api -c blue,green \"npm:dev:web\" \"npm:dev:api\"",
+    "dev:web": "npm -w apps/web run dev",
+    "dev:api": ".venv/bin/uvicorn apps.api.main:app --reload --host 127.0.0.1 --port 8001",
+    "dev:agent": ".venv/bin/python apps/mirror_agent/bridge.py dev",
+    "build": "npm -w apps/web run build",
+    "lint": "npm -w apps/web run lint",
+    "test": ".venv/bin/pytest"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
