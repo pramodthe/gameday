@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -93,15 +94,24 @@ def _qdrant_headers() -> dict[str, str]:
     return {"api-key": key, "Content-Type": "application/json"}
 
 
-def retrieve_memories(user_id: str, query: str, *, limit: int = 3) -> list[dict[str, Any]]:
+def retrieve_memories(
+    user_id: str,
+    query: str,
+    *,
+    limit: int = 3,
+    kinds: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
     url = (os.environ.get("QDRANT_URL") or "").rstrip("/")
     key = (os.environ.get("QDRANT_API_KEY") or "").strip()
     if not (url and key):
         return []
     collection = os.environ.get("QDRANT_MIRROR_COLLECTION", "gameday_memories_v2")
+    filters: list[dict[str, Any]] = [{"key": "user_id", "match": {"value": user_id}}]
+    if kinds:
+        filters.append({"key": "kind", "match": {"any": list(kinds)}})
     payload = {
         "query": _embedding(query),
-        "filter": {"must": [{"key": "user_id", "match": {"value": user_id}}]},
+        "filter": {"must": filters},
         "limit": limit,
         "with_payload": True,
     }
@@ -140,6 +150,12 @@ def _store_memory_payload(user_id: str, room_name: str, summary: str, payload: d
                 json={"field_name": "user_id", "field_schema": "keyword"},
             )
             index_response.raise_for_status()
+            kind_index_response = client.put(
+                f"{url}/collections/{collection}/index?wait=true",
+                headers=_qdrant_headers(),
+                json={"field_name": "kind", "field_schema": "keyword"},
+            )
+            kind_index_response.raise_for_status()
             response = client.put(
                 f"{url}/collections/{collection}/points?wait=true",
                 headers=_qdrant_headers(),
@@ -152,6 +168,7 @@ def _store_memory_payload(user_id: str, room_name: str, summary: str, payload: d
                                 "user_id": user_id,
                                 "session_id": room_name,
                                 "summary": summary,
+                                "created_at": datetime.now(timezone.utc).isoformat(),
                                 **payload,
                             },
                         }
@@ -194,6 +211,64 @@ def store_performance_memory(
             "adaptation": adaptation,
         },
     )
+
+
+def workout_memory_summary(workout: dict[str, Any]) -> str:
+    exercises: list[str] = []
+    for exercise in workout.get("exercises") or []:
+        if not isinstance(exercise, dict):
+            continue
+        name = str(exercise.get("name") or exercise.get("motion_pattern") or "Exercise")
+        sets = int(exercise.get("sets") or 1)
+        reps = int(exercise.get("reps") or 0)
+        hold_seconds = int(exercise.get("hold_seconds") or 0)
+        dose = f"{sets} sets x {hold_seconds}-second holds" if hold_seconds else f"{sets} sets x {reps} reps"
+        exercises.append(f"{name}: {dose}")
+    title = str(workout.get("title") or "Saved workout")
+    intensity = str(workout.get("intensity") or "planned")
+    duration = int(workout.get("estimated_minutes") or 0)
+    routine = "; ".join(exercises) or "No exercises were recorded"
+    return f'Workout "{title}" ({intensity}, {duration} minutes): {routine}.'
+
+
+def store_workout_memory(user_id: str, room_name: str, workout: dict[str, Any]) -> bool:
+    return _store_memory_payload(
+        user_id,
+        room_name,
+        workout_memory_summary(workout),
+        {"kind": "workout", "workout": workout},
+    )
+
+
+def recall_voice_context(user_id: str) -> tuple[str, list[dict[str, Any]]]:
+    searches = (
+        ("previous workout exercise routine movements sets reps", ("workout",), 3),
+        ("previous verified exercise movement set form score", ("movement",), 3),
+        ("recent readiness sleep recovery training fuel mindset spending", ("checkin",), 3),
+    )
+    recalled: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for query, kinds, limit in searches:
+        for memory in retrieve_memories(user_id, query, limit=limit, kinds=kinds):
+            key = (
+                str(memory.get("kind") or ""),
+                str(memory.get("session_id") or ""),
+                str(memory.get("summary") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            recalled.append(memory)
+    recalled.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    selected = recalled[:6]
+    if not selected:
+        return "No prior check-in, workout, or verified movement is available yet.", []
+    lines = [
+        f"{str(memory.get('kind') or 'session').upper()}: {str(memory.get('summary') or '')}"
+        for memory in selected
+        if memory.get("summary")
+    ]
+    return "\n".join(lines), selected
 
 
 def generate_plan(

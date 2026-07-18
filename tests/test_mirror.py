@@ -12,7 +12,15 @@ from gameday_mirror.exercises import checkin_resume_context, exercise_context_up
 from gameday_mirror.lessons import fallback_lesson
 from gameday_mirror.lyzr import _extract_json, _managed_agents, _route, _scoped_session_id
 from gameday_mirror import sponsors
-from gameday_mirror.sponsors import DEFAULT_PLAN, EMBED_DIM, _embedding, validate_plan
+from gameday_mirror.sponsors import (
+    DEFAULT_PLAN,
+    EMBED_DIM,
+    _embedding,
+    recall_voice_context,
+    store_workout_memory,
+    validate_plan,
+    workout_memory_summary,
+)
 from gameday_mirror.superflow import _parse_result, enabled as superflow_enabled
 from gameday_mirror.vision import fallback_analysis
 from gameday_mirror.workouts import WorkoutAdaptation, WorkoutSession, fallback_adaptation, fallback_workout
@@ -179,6 +187,58 @@ def test_workout_fallback_tailors_to_recovery() -> None:
         runtime_fields = {"source", "decision_trace", "orchestration"}
         WorkoutSession.model_validate({k: v for k, v in session.items() if k not in runtime_fields})
         assert all(ex["motion_pattern"] in tracked for ex in session["exercises"])
+
+
+def test_workout_memory_records_exact_exercise_doses(monkeypatch) -> None:
+    workout = fallback_workout("good")
+    summary = workout_memory_summary(workout)
+
+    assert 'Workout "Full-body base"' in summary
+    assert "Bodyweight Squat: 3 sets x 10 reps" in summary
+    assert "Forearm Plank: 3 sets x 30-second holds" in summary
+
+    captured: dict[str, object] = {}
+
+    def fake_store(user_id, room_name, stored_summary, payload):
+        captured.update(user_id=user_id, room_name=room_name, summary=stored_summary, payload=payload)
+        return True
+
+    monkeypatch.setattr(sponsors, "_store_memory_payload", fake_store)
+    assert store_workout_memory("athlete-1", "room-1", workout) is True
+    assert captured["payload"]["kind"] == "workout"
+
+
+def test_voice_context_prioritizes_saved_routine(monkeypatch) -> None:
+    memories = {
+        "workout": [
+            {
+                "kind": "workout",
+                "session_id": "room-2",
+                "created_at": "2026-07-18T02:00:00+00:00",
+                "summary": "Workout Full-body base: squats and push-ups.",
+            }
+        ],
+        "movement": [
+            {
+                "kind": "movement",
+                "session_id": "room-1",
+                "created_at": "2026-07-17T02:00:00+00:00",
+                "summary": "Push-up set: 8 verified reps.",
+            }
+        ],
+        "checkin": [],
+    }
+
+    def fake_retrieve(user_id, query, *, limit=3, kinds=None):
+        assert user_id == "athlete-1"
+        return memories[(kinds or ("",))[0]]
+
+    monkeypatch.setattr(sponsors, "retrieve_memories", fake_retrieve)
+    context, recalled = recall_voice_context("athlete-1")
+
+    assert context.startswith("WORKOUT: Workout Full-body base")
+    assert "MOVEMENT: Push-up set" in context
+    assert [item["kind"] for item in recalled] == ["workout", "movement"]
 
 
 def test_lyzr_json_parser_accepts_fenced_output() -> None:

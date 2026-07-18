@@ -15,9 +15,11 @@ from gameday_mirror.persistence import complete_session, ensure_session, record_
 from gameday_mirror.lessons import generate_exercise_lesson
 from gameday_mirror.sponsors import (
     generate_plan,
+    recall_voice_context,
     retrieve_memories,
     store_memory,
     store_performance_memory,
+    store_workout_memory,
     validate_plan,
 )
 from gameday_mirror.vision import analyze_movement, fallback_analysis
@@ -325,11 +327,11 @@ def mirror_token() -> dict[str, object]:
 @router.get("/sessions/{room_name}/context")
 def mirror_context(room_name: str) -> dict[str, object]:
     profile_id = os.environ.get("INSFORGE_PROFILE_ID", "gameday-demo")
-    memories = retrieve_memories(profile_id, "today's readiness and prior commitments", limit=3)
+    recent_memory, memories = recall_voice_context(profile_id)
     return {
         "roomName": room_name,
         "athleteName": os.environ.get("MIRROR_ATHLETE_NAME", "Jordan"),
-        "recentMemory": memories[0].get("summary") if memories else "No prior check-in is available yet.",
+        "recentMemory": recent_memory,
         "memories": memories,
     }
 
@@ -491,12 +493,15 @@ async def workout(body: WorkoutIn) -> dict[str, object]:
     except Exception:
         memory = ""
     session_id = body.room_name or f"gameday-{profile_id}"
-    return {
-        "workout": await generate_workout(
-            body.goal,
-            body.recovery_status,
-            memory,
-            session_id=session_id,
-            user_id=profile_id,
-        )
-    }
+    generated_workout = await generate_workout(
+        body.goal,
+        body.recovery_status,
+        memory,
+        session_id=session_id,
+        user_id=profile_id,
+    )
+    try:
+        memory_persisted = store_workout_memory(profile_id, session_id, generated_workout)
+    except Exception:
+        memory_persisted = False
+    return {"workout": generated_workout, "memory_persisted": memory_persisted}
