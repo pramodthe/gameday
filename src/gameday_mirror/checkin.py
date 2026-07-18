@@ -22,6 +22,14 @@ CATEGORIES: tuple[str, ...] = (
     "spending",
 )
 
+CHECKIN_STEPS: tuple[tuple[str, ...], ...] = (
+    ("sleep", "recovery"),
+    ("training",),
+    ("fuel",),
+    ("mindset", "spending"),
+)
+CHECKIN_TOTAL_STEPS = len(CHECKIN_STEPS)
+
 # Keyword cues per category. Kept deterministic so classification works with no
 # provider key; an OpenAI classifier can later slot in behind classify_answer().
 _KEYWORDS: dict[str, tuple[str, ...]] = {
@@ -71,6 +79,24 @@ def classify_answer(transcript: str, already_captured: Iterable[str]) -> str:
             best_category = category
             best_score = score
     return best_category
+
+
+def classify_answer_categories(
+    transcript: str,
+    already_captured: Iterable[str],
+) -> tuple[str, ...]:
+    """Map one primary check-in answer to every dimension it covers."""
+    captured = set(already_captured)
+    category = classify_answer(transcript, captured)
+    step = next((group for group in CHECKIN_STEPS if category in group), (category,))
+    remaining = tuple(item for item in step if item not in captured)
+    return remaining or (category,)
+
+
+def completed_steps(captured_categories: Iterable[str]) -> int:
+    """Count completed primary questions from the six stored dimensions."""
+    captured = set(captured_categories)
+    return sum(set(step).issubset(captured) for step in CHECKIN_STEPS)
 
 
 def checkin_complete(captured_categories: Iterable[str]) -> bool:

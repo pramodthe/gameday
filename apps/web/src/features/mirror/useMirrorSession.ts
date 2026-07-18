@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { DAILY_PLAN, DEMO_QUESTIONS, INITIAL_METRICS, MEMORY_TEXT } from './demoScenario';
-import type { AgentStage, LiveMirrorEvent, MirrorMetric, TranscriptMessage } from './types';
+import { DAILY_PLAN, DEMO_QUESTIONS, DEMO_WORKOUT, INITIAL_METRICS, MEMORY_TEXT } from './demoScenario';
+import type { AgentStage, LiveMirrorEvent, MirrorMetric, TranscriptMessage, WorkoutSession } from './types';
+
+const API_BASE = (import.meta.env.DEV ? '' : (import.meta.env.VITE_API_BASE_URL ?? '')).replace(/\/$/, '');
 
 const wait = (duration: number) => new Promise((resolve) => window.setTimeout(resolve, duration));
 
@@ -21,12 +23,40 @@ export function useMirrorSession() {
   const [memoryText, setMemoryText] = useState<string | null>(null);
   const [planVisible, setPlanVisible] = useState(false);
   const [plan, setPlan] = useState(DAILY_PLAN);
+  const [planSource, setPlanSource] = useState<string | null>(null);
   const [streak, setStreak] = useState(5);
   const [totalSteps, setTotalSteps] = useState(DEMO_QUESTIONS.length);
+  const [workout, setWorkout] = useState<WorkoutSession | null>(null);
+  const [workoutVisible, setWorkoutVisible] = useState(false);
+  const [workoutLoading, setWorkoutLoading] = useState(false);
   const runIdRef = useRef(0);
+  const metricsRef = useRef(metrics);
+
+  useEffect(() => {
+    metricsRef.current = metrics;
+  }, [metrics]);
 
   const currentQuestion = DEMO_QUESTIONS[questionIndex] ?? null;
   const progress = stage === 'complete' ? totalSteps : Math.min(questionIndex, totalSteps);
+
+  const buildWorkout = useCallback(async (recoveryStatus: string, goal = '', roomName = '') => {
+    setWorkoutVisible(true);
+    setWorkoutLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/mirror/workout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recovery_status: recoveryStatus, goal, room_name: roomName }),
+      });
+      if (!response.ok) throw new Error('workout request failed');
+      const body = await response.json() as { workout: WorkoutSession };
+      setWorkout(body.workout);
+    } catch {
+      setWorkout(DEMO_WORKOUT);
+    } finally {
+      setWorkoutLoading(false);
+    }
+  }, []);
 
   const say = useCallback(async (text: string, runId: number) => {
     setStage('speaking');
@@ -47,7 +77,11 @@ export function useMirrorSession() {
     setTotalSteps(DEMO_QUESTIONS.length);
     setPlanVisible(false);
     setPlan(DAILY_PLAN);
+    setPlanSource(null);
     setStreak(5);
+    setWorkout(null);
+    setWorkoutVisible(false);
+    setWorkoutLoading(false);
     await wait(650);
     if (runIdRef.current !== runId) return;
     await say(
@@ -96,6 +130,8 @@ export function useMirrorSession() {
       setPlanVisible(true);
       setStage('complete');
       setStreak(6);
+      setWorkout(DEMO_WORKOUT);
+      setWorkoutVisible(true);
     },
     [currentQuestion, questionIndex, say, stage],
   );
@@ -111,7 +147,11 @@ export function useMirrorSession() {
     setTotalSteps(DEMO_QUESTIONS.length);
     setPlanVisible(false);
     setPlan(DAILY_PLAN);
+    setPlanSource(null);
     setStreak(5);
+    setWorkout(null);
+    setWorkoutVisible(false);
+    setWorkoutLoading(false);
   }, []);
 
   const beginLive = useCallback(() => {
@@ -125,7 +165,11 @@ export function useMirrorSession() {
     setTotalSteps(DEMO_QUESTIONS.length);
     setPlanVisible(false);
     setPlan(DAILY_PLAN);
+    setPlanSource(null);
     setStreak(5);
+    setWorkout(null);
+    setWorkoutVisible(false);
+    setWorkoutLoading(false);
   }, []);
 
   const applyLiveEvent = useCallback(
@@ -165,12 +209,15 @@ export function useMirrorSession() {
       }
       if (event.type === 'plan_ready' && event.actions?.length) {
         setPlan(event.actions);
+        setPlanSource(event.plan_source ?? null);
         setPlanVisible(true);
         return;
       }
       if (event.type === 'checkin_completed') {
         if (event.streak !== undefined) setStreak(event.streak);
         setStage('complete');
+        const recovery = metricsRef.current.find((metric) => metric.key === 'recovery');
+        void buildWorkout(recovery?.tone ?? '', '', event.session_id ?? '');
         return;
       }
       if (event.type !== 'transcript_finalized' || !event.speaker || !event.text) return;
@@ -178,24 +225,9 @@ export function useMirrorSession() {
       const speaker = event.speaker;
       const text = event.text;
       setMessages((current) => [...current, createMessage(speaker, text)]);
-      if (speaker === 'agent') {
-        setStage('speaking');
-        return;
-      }
-
-      const activeQuestion = DEMO_QUESTIONS[questionIndex];
-      if (!activeQuestion) return;
-      setStage('thinking');
-      setMetrics((current) =>
-        current.map((metric) => {
-          const update = activeQuestion.updates[metric.key];
-          return update ? { ...metric, ...update } : metric;
-        }),
-      );
-      const nextIndex = questionIndex + 1;
-      setQuestionIndex(nextIndex);
+      if (speaker === 'athlete') setStage('thinking');
     },
-    [questionIndex],
+    [buildWorkout],
   );
 
   return useMemo(
@@ -209,15 +241,20 @@ export function useMirrorSession() {
       memoryText,
       planVisible,
       plan,
+      planSource,
       progress,
       totalSteps,
       streak,
+      workout,
+      workoutVisible,
+      workoutLoading,
       start,
       submitAnswer,
       beginLive,
       applyLiveEvent,
+      buildWorkout,
       reset,
     }),
-    [applyLiveEvent, beginLive, currentQuestion, memoryText, memoryVisible, messages, metrics, plan, planVisible, progress, questionIndex, reset, stage, start, streak, submitAnswer, totalSteps],
+    [applyLiveEvent, beginLive, buildWorkout, currentQuestion, memoryText, memoryVisible, messages, metrics, plan, planSource, planVisible, progress, questionIndex, reset, stage, start, streak, submitAnswer, totalSteps, workout, workoutLoading, workoutVisible],
   );
 }

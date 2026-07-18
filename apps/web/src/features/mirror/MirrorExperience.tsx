@@ -26,8 +26,9 @@ import { CameraBackdrop } from './CameraBackdrop';
 import { ExerciseLessonCard } from './ExerciseLessonCard';
 import { LiveKitCameraBackdrop } from './LiveKitCameraBackdrop';
 import { MovementCoach } from './MovementCoach';
+import { WorkoutSessionCard } from './WorkoutSessionCard';
 import { useMirrorSession } from './useMirrorSession';
-import type { AgUiToolCallEvent, ExerciseEventPublisher, ExerciseLesson, LiveMirrorConfig, LiveMirrorPayload, MetricKey, MirrorMetric } from './types';
+import type { AgUiToolCallEvent, ExerciseEventPublisher, ExerciseLesson, LiveMirrorConfig, LiveMirrorPayload, MetricKey, MirrorMetric, TrackedMovement, WorkoutExercise } from './types';
 import './mirror.css';
 
 const API_BASE = (import.meta.env.DEV ? '' : (import.meta.env.VITE_API_BASE_URL ?? '')).replace(/\/$/, '');
@@ -55,6 +56,14 @@ function isAgUiToolCallEvent(event: LiveMirrorPayload): event is AgUiToolCallEve
     || event.type === 'TOOL_CALL_ARGS'
     || event.type === 'TOOL_CALL_END'
     || event.type === 'TOOL_CALL_RESULT';
+}
+
+function isTrackedMovement(value: string | null): value is TrackedMovement {
+  return value === 'squat'
+    || value === 'pushup'
+    || value === 'lunge'
+    || value === 'plank'
+    || value === 'glute_bridge';
 }
 
 function MetricRow({ metric, active }: { metric: MirrorMetric; active: boolean }) {
@@ -99,6 +108,7 @@ export function MirrorExperience() {
   const [liveConfig, setLiveConfig] = useState<LiveMirrorConfig>({ configured: false });
   const [liveMode, setLiveMode] = useState(false);
   const [movementMode, setMovementMode] = useState(false);
+  const [movementExercise, setMovementExercise] = useState<TrackedMovement>('squat');
   const [exerciseRequestId, setExerciseRequestId] = useState<string>();
   const [lessonRequest, setLessonRequest] = useState<{ requestId: string; exerciseName: string; lesson?: ExerciseLesson } | null>(null);
   const [cameraVideo, setCameraVideo] = useState<HTMLVideoElement | null>(null);
@@ -189,14 +199,16 @@ export function MirrorExperience() {
         return;
       }
       if (exercise.requestId) {
+        if (isTrackedMovement(exercise.name)) setMovementExercise(exercise.name);
         setExerciseRequestId(exercise.requestId);
         setMovementMode(true);
       }
       return;
     }
     if (isAgUiToolCallEvent(event)) return;
-    if (event.type === 'exercise_requested' && event.exercise === 'squat') {
+    if (event.type === 'exercise_requested' && event.exercise && isTrackedMovement(event.exercise)) {
       setLessonRequest(null);
+      setMovementExercise(event.exercise);
       setExerciseRequestId(event.request_id ?? crypto.randomUUID());
       setMovementMode(true);
     }
@@ -278,6 +290,7 @@ export function MirrorExperience() {
         active={movementMode}
         videoElement={cameraVideo}
         roomName={liveConfig.roomName}
+        exercise={movementExercise}
         autoStartRequestId={exerciseRequestId}
         onExerciseEvent={publishExerciseEvent}
         onClose={closeExercise}
@@ -289,7 +302,8 @@ export function MirrorExperience() {
             request={lessonRequest}
             onEvent={publishExerciseEvent}
             onClose={() => setLessonRequest(null)}
-            onPracticeSquat={() => {
+            onPractice={(movement) => {
+              setMovementExercise(movement);
               setLessonRequest(null);
               setExerciseRequestId(`manual-${crypto.randomUUID()}`);
               setMovementMode(true);
@@ -317,6 +331,7 @@ export function MirrorExperience() {
             disabled={!cameraEnabled || !cameraVideo}
             onClick={() => {
               setLessonRequest(null);
+              setMovementExercise('squat');
               setMovementMode((current) => {
                 setExerciseRequestId(current ? undefined : `manual-${crypto.randomUUID()}`);
                 return !current;
@@ -493,7 +508,7 @@ export function MirrorExperience() {
       </footer>
 
       <AnimatePresence>
-        {session.planVisible && (
+        {session.planVisible && !movementMode && !lessonRequest && (
           <motion.section className="mirror-plan" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
             <motion.div
               className="mirror-plan__panel"
@@ -501,7 +516,9 @@ export function MirrorExperience() {
               animate={{ opacity: 1, y: 0, scale: 1 }}
               transition={{ type: 'spring', stiffness: 220, damping: 24 }}
             >
-              <div className="mirror-plan__eyebrow"><Sparkles size={15} /> Built from today + yesterday</div>
+              <div className="mirror-plan__eyebrow">
+                <Sparkles size={15} /> {session.planSource === 'lyzr' ? 'Lyzr Performance Director · today + memory' : 'Built from today + yesterday'}
+              </div>
               <h1>Jordan’s game plan</h1>
               <p>Three moves. Zero noise. Protect tonight’s practice without ignoring the rest of your life.</p>
               <div className="mirror-plan__actions">
@@ -519,6 +536,21 @@ export function MirrorExperience() {
                   </motion.article>
                 ))}
               </div>
+              <WorkoutSessionCard
+                workout={session.workout}
+                visible={session.workoutVisible}
+                loading={session.workoutLoading}
+                onStartExercise={(exercise: WorkoutExercise) => {
+                  setLessonRequest(null);
+                  setMovementExercise(exercise.motion_pattern);
+                  setExerciseRequestId(`workout-${crypto.randomUUID()}`);
+                  setMovementMode(true);
+                }}
+                onRebuild={() => {
+                  const recovery = session.metrics.find((metric) => metric.key === 'recovery');
+                  void session.buildWorkout(recovery?.tone ?? '', '', liveConfig.roomName ?? '');
+                }}
+              />
               <div className="mirror-plan__footer">
                 <span><Flame size={18} /> 6-day rhythm locked</span>
                 <button type="button" onClick={session.reset}>Done for today <ChevronRight size={17} /></button>

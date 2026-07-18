@@ -18,6 +18,8 @@ body,
   margin: 0;
 }
 
+html { scroll-behavior: smooth; }
+
 button,
 input { font: inherit; }
 button { cursor: pointer; }

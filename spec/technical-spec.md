@@ -8,14 +8,16 @@ GameDay Mirror is a realtime web experience with a React client, a LiveKit room,
 
 ```text
 React mirror UI
-  ├── LiveKit camera, microphone, audio, transcript, data events
+  ├── LiveKit camera, microphone, audio, transcript, AG-UI data events
   ├── InsForge realtime metric and plan subscription
   └── Local visual state and text fallback
 
 LiveKit room
   └── Python LiveKit Agents worker
         └── ElevenLabs realtime speech session
+              ├── Client tools → browser exercise experiences
               └── Agent orchestrator / Lyzr workflow
+                    ├── OpenAI structured exercise lessons
                     ├── InsForge persistence
                     ├── Qdrant memory retrieval
                     └── Enkrypt output safety check
@@ -39,6 +41,7 @@ The UI should use LiveKit building blocks rather than a stock conferencing layou
 - Create one room per check-in session.
 - Dispatch the voice worker through a server-issued token.
 - Publish structured data events such as progress and metric updates.
+- Carry AG-UI-compatible tool and state events over reliable data channels.
 - Keep API secrets and room-token generation server-side.
 
 ### ElevenLabs
@@ -48,15 +51,33 @@ The UI should use LiveKit building blocks rather than a stock conferencing layou
 - Use signed URLs or server-side credentials; never expose the API key to the browser.
 - Emit finalized transcripts to the orchestrator.
 
+### OpenAI Exercise Intelligence
+
+- Use the Responses API with strict Structured Outputs to generate typed exercise lessons.
+- Render generated lesson data through owned React and SVG components; never inject model-authored HTML.
+- Use OpenAI Realtime vision only for selected camera frames and derived squat measurements.
+- Fall back to curated bodyweight lessons and deterministic pose analysis when unavailable.
+
 ### Lyzr Agent Workflow
 
-The orchestration layer owns a constrained state machine:
+Lyzr is the multi-agent decision layer around the realtime execution loop:
 
 ```text
-CONNECTING → GREETING → QUESTION_1..4 → SUMMARIZING → PLAN_READY → COMPLETE
+READINESS → PLAN → WORKOUT → VERIFIED_SET → ADAPTATION → MEMORY
 ```
 
-The agent may call only defined tools:
+The `GameDay Performance Director` Manager Agent dynamically routes readiness and workout requests. `GameDay Verified-Set Adaptation` is a deterministic SuperFlow that invokes the Movement Adaptation Coach after a camera-verified set and exposes its workflow task ID in application telemetry. Every specialist uses Cognis cross-session memory, shared Global Context, the `GameDay Athlete Safety` RAI policy, and strict Pydantic-derived JSON schemas. Stable `user_id` and role-scoped LiveKit `session_id` values preserve continuity without leaking one specialist's working context into another.
+
+Provisioning is API-driven and idempotent:
+
+- `scripts/configure_lyzr_agents.py` creates or updates the manager, specialists, Cognis, context, RAI, and schemas.
+- `scripts/configure_lyzr_superflow.py` creates or updates the verified-set workflow.
+- `scripts/configure_lyzr_tools.py` registers the optional InsForge OpenAPI context tool.
+- `functions/gameday-agent-context.ts` exposes only scoped session and movement history behind a shared tool secret.
+
+SRS reflection is intentionally excluded from the live workout and adaptation path because it materially increases latency. It can be enabled for offline readiness-plan quality review. If Manager routing fails, the requested specialist still runs directly; if SuperFlow fails, adaptation falls back to the direct specialist and then to deterministic rules.
+
+The voice agent may call only defined UI tools:
 
 - `get_recent_context`
 - `record_answer`
@@ -64,8 +85,10 @@ The agent may call only defined tools:
 - `advance_checkin`
 - `generate_daily_plan`
 - `complete_checkin`
+- `teach_exercise(exercise_name)`
+- `start_exercise(exercise)`
 
-Tool results, not free-form model text, drive UI state.
+Tool results, typed Lyzr responses, and camera telemetry—not free-form model text—drive UI state. If Lyzr fails validation or times out, the existing OpenAI structured-output generator runs; if that fails, a curated Core-5 session is returned.
 
 ### InsForge
 
@@ -76,7 +99,7 @@ Tool results, not free-form model text, drive UI state.
 
 ### Qdrant
 
-- Store embeddings of completed reflections and plans.
+- Store embeddings of completed reflections, plans, and camera-verified movement results.
 - Retrieve a maximum of three relevant memories before the greeting and final plan.
 - Filter retrieval by authenticated user ID.
 - Store source session IDs and dates in payload metadata for explainability.
@@ -157,7 +180,20 @@ Every event includes `session_id`, `event_id`, and `timestamp`.
 - `memory_used`: short explanation and source date.
 - `plan_ready`: validated actions and rationale.
 - `checkin_completed`: streak and completion summary.
+- `exercise_requested`: opens the squat coach and auto-starts after full-body lock.
+- `exercise_lesson_requested`: asks the browser to generate and display a named exercise lesson.
 - `recoverable_error`: user-facing message and retry action.
+
+Exercise interactions use an AG-UI-compatible subset:
+
+- `TOOL_CALL_START` → `TOOL_CALL_ARGS` → `TOOL_CALL_END` identifies one voice tool request.
+- `STATE_SNAPSHOT` carries the complete exercise mode, status, request ID, lesson, metrics, and monotonic revision.
+- Browser `CUSTOM` events named `gameday.exercise.telemetry` acknowledge loading, readiness, progress, completion, failure, or closure.
+- `TOOL_CALL_RESULT` is emitted only after a matching browser acknowledgement; a six-second timeout returns an error to ElevenLabs.
+
+The bridge rejects telemetry whose request ID does not match the active tool call and ignores idempotent
+updates. Accepted lesson cues, body visibility, verified reps, and final scores become ElevenLabs
+contextual updates. Nova answers from those trusted states without claiming direct access to raw video.
 
 Events must be idempotent by `event_id`. The client applies LiveKit data events immediately and reconciles against InsForge realtime records.
 
@@ -168,9 +204,10 @@ Events must be idempotent by `event_id`. The client applies LiveKit data events 
 3. Worker opens an authenticated ElevenLabs session.
 4. Orchestrator retrieves recent Qdrant memories and greets the athlete.
 5. Each finalized answer triggers normalization, persistence, and a UI event.
-6. After question four, the orchestrator generates a plan using today's metrics and cited memories.
+6. After all six readiness dimensions are covered, Lyzr generates a plan and Core-5 workout using today's metrics and cited memories.
 7. Enkrypt validates the plan.
-8. The plan is published, accepted, persisted, embedded, and added to the streak.
+8. Each completed set is analyzed, persisted, embedded in Qdrant, and sent through Lyzr SuperFlow for a next-set decision.
+9. Plans, workouts, adaptations, and their provider provenance are visible in the UI.
 
 ## Reliability and Fallbacks
 
@@ -178,6 +215,7 @@ Events must be idempotent by `event_id`. The client applies LiveKit data events 
 - If voice fails, reveal a text field without resetting progress.
 - If Qdrant fails, continue without prior memory and disclose that limitation.
 - If Enkrypt is unavailable, use a conservative rules-based safety filter.
+- If lesson generation fails, return a curated bodyweight lesson without blocking the voice session.
 - If InsForge realtime disconnects, apply LiveKit events and retry persistence.
 - Demo mode uses seeded memory and deterministic metric extraction fallbacks.
 
@@ -195,7 +233,7 @@ Events must be idempotent by `event_id`. The client applies LiveKit data events 
 1. Camera-first static mirror and responsive overlays.
 2. LiveKit room, token endpoint, and device controls.
 3. ElevenLabs voice worker and transcript events.
-4. Constrained four-question state machine.
+4. Adaptive six-dimension readiness state machine.
 5. InsForge persistence and realtime reconciliation.
 6. Qdrant memory retrieval and visible memory moment.
 7. Final-plan safety check and completion animation.

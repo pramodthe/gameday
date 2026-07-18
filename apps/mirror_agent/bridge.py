@@ -14,8 +14,8 @@ from livekit import agents, rtc
 from livekit.agents import JobContext, WorkerOptions, cli
 
 from gameday_mirror.agui import ExerciseSharedState, tool_result_event
-from gameday_mirror.checkin import classify_answer
-from gameday_mirror.exercises import exercise_context_update, is_exercise_request
+from gameday_mirror.checkin import CHECKIN_TOTAL_STEPS, classify_answer_categories, completed_steps
+from gameday_mirror.exercises import checkin_resume_context, exercise_context_update, is_exercise_request
 
 load_dotenv()
 load_dotenv(".env.local", override=True)
@@ -26,6 +26,26 @@ agent_name = os.environ.get("LIVEKIT_AGENT_NAME", "gameday-elevenlabs")
 user_input_rate = int(os.environ.get("MIRROR_USER_INPUT_RATE", "16000"))
 agent_output_rate = int(os.environ.get("MIRROR_AGENT_OUTPUT_RATE", "24000"))
 mirror_api_url = os.environ.get("MIRROR_API_URL", "http://127.0.0.1:8001").rstrip("/")
+exercise_targets = {
+    "squat": 5,
+    "pushup": 8,
+    "lunge": 6,
+    "plank": 30,
+    "glute_bridge": 10,
+}
+exercise_aliases = {
+    "push-up": "pushup",
+    "push up": "pushup",
+    "lunges": "lunge",
+    "glute bridge": "glute_bridge",
+    "glute bridges": "glute_bridge",
+}
+
+
+def normalize_exercise(value: object) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    normalized = exercise_aliases.get(normalized.replace("_", " "), normalized)
+    return normalized if normalized in exercise_targets else ""
 
 
 async def signed_url() -> str:
@@ -55,6 +75,8 @@ async def entrypoint(ctx: JobContext) -> None:
     last_agent_state = ""
     exercise_state = ExerciseSharedState(ctx.room.name)
     pending_tool_acks: dict[str, asyncio.Future[dict[str, object]]] = {}
+    captured_answers: list[dict[str, str]] = []
+    checkin_finished = False
 
     async def publish_event(event: dict[str, object]) -> None:
         nonlocal last_agent_state
@@ -107,6 +129,11 @@ async def entrypoint(ctx: JobContext) -> None:
         context = exercise_context_update(event)
         if not context:
             return
+        if event.get("type") in {"exercise_completed", "exercise_closed"}:
+            context = (
+                f"{context} "
+                f"{checkin_resume_context(completed_steps(answer['category'] for answer in captured_answers), CHECKIN_TOTAL_STEPS)}"
+            )
         websocket = await websocket_ready
         await websocket.send_str(json.dumps({"type": "contextual_update", "text": context}))
 
@@ -167,19 +194,25 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     websocket_ready.set_result(websocket)
 
-    captured_answers: list[dict[str, str]] = []
-
     async def process_answer(transcript: str) -> None:
-        if exercise_state.is_active or is_exercise_request(transcript):
+        nonlocal checkin_finished
+        if checkin_finished or exercise_state.is_active or is_exercise_request(transcript):
             return
-        category = classify_answer(transcript, [answer["category"] for answer in captured_answers])
-        captured_answers.append({"category": category, "transcript": transcript})
+        categories = classify_answer_categories(
+            transcript,
+            [answer["category"] for answer in captured_answers],
+        )
+        captured_answers.extend(
+            {"category": category, "transcript": transcript}
+            for category in categories
+        )
         try:
             async with http.post(
                 f"{mirror_api_url}/api/mirror/answers",
                 json={
                     "room_name": ctx.room.name,
-                    "category": category,
+                    "category": categories[0],
+                    "categories": categories,
                     "transcript": transcript,
                     "answers": captured_answers,
                 },
@@ -187,6 +220,8 @@ async def entrypoint(ctx: JobContext) -> None:
                 response.raise_for_status()
                 body = await response.json()
                 for mirror_event in body.get("events", []):
+                    if mirror_event.get("type") == "checkin_completed":
+                        checkin_finished = True
                     await publish_event(mirror_event)
         except (aiohttp.ClientError, ValueError, TypeError):
             await publish_event(
@@ -280,15 +315,33 @@ async def entrypoint(ctx: JobContext) -> None:
             )
             return
 
-        if tool_name != "start_squat_exercise":
+        if tool_name != "start_exercise":
             await finish_tool(
                 {"status": "unsupported", "message": f"Unsupported client tool: {tool_name}"},
                 True,
             )
             return
 
+        parameters = tool_call.get("parameters")
+        if isinstance(parameters, str):
+            try:
+                parameters = json.loads(parameters)
+            except json.JSONDecodeError:
+                parameters = {}
+        exercise = normalize_exercise(parameters.get("exercise") if isinstance(parameters, dict) else "")
+        if not exercise:
+            await finish_tool(
+                {
+                    "status": "invalid",
+                    "message": "Choose squat, pushup, lunge, plank, or glute_bridge.",
+                },
+                True,
+            )
+            return
+        target = exercise_targets[exercise]
+
         acknowledgement_future = expect_browser_ack()
-        for protocol_event in exercise_state.begin_squat(tool_call_id, target_reps=5):
+        for protocol_event in exercise_state.begin_exercise(tool_call_id, exercise, target):
             await publish_protocol_event(protocol_event)
         acknowledgement = await wait_for_browser_ack(acknowledgement_future)
         if acknowledgement is None:
@@ -298,7 +351,7 @@ async def entrypoint(ctx: JobContext) -> None:
             await finish_tool(
                 {
                     "status": "ui_timeout",
-                    "exercise": "squat",
+                    "exercise": exercise,
                     "message": "The camera exercise could not be opened in the athlete's browser.",
                 },
                 True,
@@ -307,15 +360,27 @@ async def entrypoint(ctx: JobContext) -> None:
         await finish_tool(
             {
                 "status": "opened",
-                "exercise": "squat",
-                "target_reps": 5,
+                "exercise": exercise,
+                "target_reps": target,
                 "request_id": tool_call_id,
-                "next_step": "Ask the athlete to step back until their full body and ankles are visible. The set starts automatically after body lock.",
+                "next_step": "Ask the athlete to move until the working joints are visible. The set starts automatically after body lock.",
             },
             False,
         )
 
+    playout_revision = 0
+
+    async def mark_listening_after_playout(revision: int) -> None:
+        timeout = max(source.queued_duration + 1.0, 2.0)
+        try:
+            await asyncio.wait_for(source.wait_for_playout(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        if revision == playout_revision:
+            await publish_event({"type": "agent_state_changed", "state": "listening"})
+
     async def send_agent_audio() -> None:
+        nonlocal playout_revision
         async for message in websocket:
             if message.type != aiohttp.WSMsgType.TEXT:
                 continue
@@ -331,7 +396,10 @@ async def entrypoint(ctx: JobContext) -> None:
                     len(pcm) // 2,
                 )
                 await source.capture_frame(frame)
+                playout_revision += 1
+                asyncio.create_task(mark_listening_after_playout(playout_revision))
             elif event_type == "interruption":
+                playout_revision += 1
                 source.clear_queue()
                 await publish_event({"type": "agent_state_changed", "state": "listening"})
             elif event_type == "user_transcript":

@@ -1,10 +1,21 @@
 from apps.api.routers.mirror import _memory_summary, _metric
 from gameday_mirror.agui import ExerciseSharedState
-from gameday_mirror.checkin import CATEGORIES, checkin_complete, classify_answer
-from gameday_mirror.exercises import exercise_context_update, exercise_is_active, is_exercise_request
+from gameday_mirror.checkin import (
+    CATEGORIES,
+    CHECKIN_TOTAL_STEPS,
+    checkin_complete,
+    classify_answer,
+    classify_answer_categories,
+    completed_steps,
+)
+from gameday_mirror.exercises import checkin_resume_context, exercise_context_update, exercise_is_active, is_exercise_request
 from gameday_mirror.lessons import fallback_lesson
+from gameday_mirror.lyzr import _extract_json, _managed_agents, _route, _scoped_session_id
+from gameday_mirror import sponsors
 from gameday_mirror.sponsors import DEFAULT_PLAN, EMBED_DIM, _embedding, validate_plan
+from gameday_mirror.superflow import _parse_result, enabled as superflow_enabled
 from gameday_mirror.vision import fallback_analysis
+from gameday_mirror.workouts import WorkoutAdaptation, WorkoutSession, fallback_adaptation, fallback_workout
 
 
 def test_sleep_metric_extracts_hours() -> None:
@@ -19,6 +30,14 @@ def test_fuel_metric_flags_missed_meal() -> None:
 
     assert metric["display_value"] == "Missed"
     assert metric["status"] == "risk"
+
+
+def test_sleep_metric_parses_spoken_number_words() -> None:
+    assert _metric("sleep", "I got about eight hours")["display_value"] == "8 hrs"
+    assert _metric("sleep", "seven and a half hours")["display_value"] == "7.5 hrs"
+    assert _metric("sleep", "eight hours")["status"] == "good"
+    # Spending spoken as words parses too
+    assert _metric("spending", "I spent about thirty five dollars")["display_value"] == "$35"
 
 
 def test_metric_covers_all_six_categories() -> None:
@@ -60,6 +79,23 @@ def test_checkin_complete_requires_full_coverage() -> None:
     assert not checkin_complete({"sleep", "fuel"})
     assert not checkin_complete(CATEGORIES[:-1])
     assert checkin_complete(CATEGORIES)
+
+
+def test_four_primary_answers_cover_all_six_dimensions() -> None:
+    captured: list[str] = []
+    transcripts = (
+        "I slept six hours and feel pretty tired.",
+        "I have a hard team practice at six.",
+        "I skipped breakfast but drank water.",
+        "I need discipline with spending; I spent thirty dollars.",
+    )
+
+    for transcript in transcripts:
+        captured.extend(classify_answer_categories(transcript, captured))
+
+    assert set(captured) == set(CATEGORIES)
+    assert completed_steps(captured) == CHECKIN_TOTAL_STEPS == 4
+    assert checkin_complete(captured)
 
 
 def test_memory_summary_varies_with_answers() -> None:
@@ -104,10 +140,159 @@ def test_pose_fallback_rewards_balanced_squat() -> None:
     assert analysis["source"] == "pose_fallback"
 
 
+def test_pose_fallback_scores_every_tracked_movement() -> None:
+    good = {
+        "squat": {"reps": 3, "min_primary_angle": 94, "symmetry_gap": 3, "alignment_deviation": 16},
+        "pushup": {"reps": 4, "min_primary_angle": 90, "symmetry_gap": 4, "alignment_deviation": 8},
+        "lunge": {"reps": 3, "min_primary_angle": 96, "symmetry_gap": 6, "alignment_deviation": 15},
+        "glute_bridge": {"reps": 5, "max_primary_angle": 172, "symmetry_gap": 5, "alignment_deviation": 12},
+        "plank": {"hold_seconds": 32, "alignment_deviation": 7},
+    }
+    for movement, metrics in good.items():
+        result = fallback_analysis(metrics, movement)
+        assert result["score"] >= 80, movement
+        assert result["source"] == "pose_fallback"
+        assert result["cues"]
+
+    # A shallow, sagging push-up loses points and gets a depth cue.
+    bad = fallback_analysis(
+        {"reps": 2, "min_primary_angle": 125, "symmetry_gap": 4, "alignment_deviation": 22}, "pushup"
+    )
+    assert bad["score"] < 85
+    assert any("elbow" in cue.lower() or "line" in cue.lower() for cue in bad["cues"])
+
+
+def test_workout_fallback_tailors_to_recovery() -> None:
+    recovery = fallback_workout("attention")
+    hard = fallback_workout("high")
+    moderate = fallback_workout("good")
+
+    assert recovery["intensity"] == "recovery"
+    assert hard["intensity"] == "hard"
+    assert moderate["intensity"] == "moderate"
+    # A low-recovery session is lighter than a well-recovered one.
+    assert len(recovery["exercises"]) < len(hard["exercises"])
+
+    # Every programmed movement is one the camera can actually track (Core 5).
+    tracked = {"squat", "pushup", "lunge", "plank", "glute_bridge"}
+    for session in (recovery, hard, moderate):
+        runtime_fields = {"source", "decision_trace", "orchestration"}
+        WorkoutSession.model_validate({k: v for k, v in session.items() if k not in runtime_fields})
+        assert all(ex["motion_pattern"] in tracked for ex in session["exercises"])
+
+
+def test_lyzr_json_parser_accepts_fenced_output() -> None:
+    parsed = _extract_json({"response": "```json\n{\"action\": \"continue\"}\n```"})
+
+    assert parsed == {"action": "continue"}
+
+
+def test_lyzr_manager_normalizes_readiness_route() -> None:
+    assert _route("plan", {"route": "readiness", "status": "delegated"}) == "plan"
+    assert _route("workout", {"route": "workout", "status": "delegated"}) == "workout"
+    assert _route("adaptation", {"route": "unknown", "status": "delegated"}) == "adaptation"
+
+
+def test_lyzr_manager_payload_lists_configured_specialists(monkeypatch) -> None:
+    monkeypatch.setenv("LYZR_PLAN_AGENT_ID", "plan-id")
+    monkeypatch.setenv("LYZR_WORKOUT_AGENT_ID", "workout-id")
+    monkeypatch.setenv("LYZR_ADAPTATION_AGENT_ID", "adaptation-id")
+
+    agents = _managed_agents()
+
+    assert [agent["id"] for agent in agents] == ["plan-id", "workout-id", "adaptation-id"]
+    assert [agent["name"] for agent in agents] == [
+        "GameDay Readiness Analyst",
+        "GameDay Workout Architect",
+        "GameDay Movement Adaptation Coach",
+    ]
+
+
+def test_lyzr_sessions_are_stable_and_isolated_by_agent() -> None:
+    assert _scoped_session_id("room-7", "director", "athlete") == "room-7--lyzr-director"
+    assert _scoped_session_id("room-7", "workout", "athlete") == "room-7--lyzr-workout"
+    assert _scoped_session_id("", "plan", "athlete") == "gameday-athlete--lyzr-plan"
+
+
+def test_plan_generation_reuses_stable_lyzr_session(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_invoke(role, message, *, session_id, user_id, memory_used):
+        captured.update(role=role, session_id=session_id, user_id=user_id)
+        return [
+            {"id": "one", "eyebrow": "Now", "title": "First", "detail": "Do one."},
+            {"id": "two", "eyebrow": "Later", "title": "Second", "detail": "Do two."},
+            {"id": "three", "eyebrow": "Tonight", "title": "Third", "detail": "Do three."},
+        ], {"status": "completed"}
+
+    monkeypatch.setattr(sponsors, "invoke_json", fake_invoke)
+    _, source = sponsors.generate_plan(
+        [{"category": "sleep", "transcript": "eight hours"}],
+        [{"summary": "Previous session"}],
+        session_id="room-stable",
+        user_id="athlete-stable",
+    )
+
+    assert source == "lyzr"
+    assert captured == {"role": "plan", "session_id": "room-stable", "user_id": "athlete-stable"}
+
+
+def test_adaptation_fallback_reduces_dose_for_low_score() -> None:
+    adaptation = fallback_adaptation("pushup", {"reps": 8}, {"score": 42})
+
+    assert adaptation["action"] == "reduce_reps"
+    assert adaptation["next_reps"] == 6
+    assert adaptation["source"] == "deterministic"
+
+
+def test_adaptation_schema_requires_nullable_output_fields() -> None:
+    schema = WorkoutAdaptation.model_json_schema()
+
+    assert set(schema["required"]) == {
+        "action",
+        "message",
+        "reason",
+        "next_reps",
+        "next_hold_seconds",
+        "next_rest_seconds",
+        "replacement_movement",
+    }
+    WorkoutAdaptation.model_validate(
+        {
+            "action": "continue",
+            "message": "Keep going.",
+            "reason": "Movement quality is stable.",
+            "next_reps": 8,
+            "next_hold_seconds": None,
+            "next_rest_seconds": 45,
+            "replacement_movement": None,
+        }
+    )
+
+
+def test_superflow_result_parser_accepts_agent_json() -> None:
+    assert _parse_result('{"action":"continue"}') == {"action": "continue"}
+    assert _parse_result(None) is None
+
+
+def test_superflow_requires_all_runtime_ids(monkeypatch) -> None:
+    monkeypatch.setenv("LYZR_API_KEY", "key")
+    monkeypatch.setenv("LYZR_SUPERFLOW_ID", "flow")
+    monkeypatch.delenv("LYZR_ADAPTATION_AGENT_ID", raising=False)
+
+    assert superflow_enabled() is False
+
+
 def test_exercise_request_is_not_recorded_as_checkin_answer() -> None:
     assert is_exercise_request("Nova, can you check my squat form?")
+    assert is_exercise_request("Start push-ups with the camera")
     assert is_exercise_request("Teach me how to do a reverse lunge")
     assert not is_exercise_request("I did squats at practice this morning")
+
+
+def test_exercise_resume_context_never_restarts_completed_checkin() -> None:
+    assert "Do not restart readiness questions" in checkin_resume_context(4, 4)
+    assert "next unanswered question only" in checkin_resume_context(2, 4)
 
 
 def test_exercise_progress_becomes_agent_context() -> None:
@@ -199,4 +384,23 @@ def test_shared_state_emits_agui_tool_and_snapshot_events() -> None:
         "TOOL_CALL_END",
         "STATE_SNAPSHOT",
     ]
+    assert events[0]["toolCallName"] == "start_exercise"
     assert events[-1]["snapshot"]["revision"] == 1
+
+
+def test_shared_state_tracks_manual_core_five_exercise() -> None:
+    state = ExerciseSharedState("room-1")
+
+    snapshot = state.apply_telemetry(
+        {
+            "type": "exercise_opened",
+            "request_id": "manual-pushup",
+            "trigger": "manual",
+            "exercise": "pushup",
+            "target_reps": 8,
+        }
+    )
+
+    assert snapshot is not None
+    assert state.exercise["name"] == "pushup"
+    assert state.exercise["targetReps"] == 8

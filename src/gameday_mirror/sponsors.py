@@ -9,6 +9,9 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field
+
+from gameday_mirror.lyzr import invoke_json
 
 EMBED_DIM = 256
 
@@ -32,6 +35,21 @@ DEFAULT_PLAN = [
         "detail": "Use the meal already available and keep dining spend under today’s target.",
     },
 ]
+
+
+class PlanAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    eyebrow: str
+    title: str
+    detail: str
+
+
+class ReadinessPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actions: list[PlanAction] = Field(min_length=3, max_length=3)
 
 
 def _hash_embedding(text: str, dimensions: int = EMBED_DIM) -> list[float]:
@@ -103,7 +121,7 @@ def retrieve_memories(user_id: str, query: str, *, limit: int = 3) -> list[dict[
         return []
 
 
-def store_memory(user_id: str, room_name: str, summary: str, actions: list[dict[str, Any]]) -> bool:
+def _store_memory_payload(user_id: str, room_name: str, summary: str, payload: dict[str, Any]) -> bool:
     url = (os.environ.get("QDRANT_URL") or "").rstrip("/")
     key = (os.environ.get("QDRANT_API_KEY") or "").strip()
     if not (url and key):
@@ -134,7 +152,7 @@ def store_memory(user_id: str, room_name: str, summary: str, actions: list[dict[
                                 "user_id": user_id,
                                 "session_id": room_name,
                                 "summary": summary,
-                                "actions": actions,
+                                **payload,
                             },
                         }
                     ]
@@ -146,40 +164,64 @@ def store_memory(user_id: str, room_name: str, summary: str, actions: list[dict[
         return False
 
 
-def generate_plan(answers: list[dict[str, str]], memories: list[dict[str, Any]]) -> tuple[list[dict[str, str]], str]:
-    api_key = (os.environ.get("LYZR_API_KEY") or "").strip()
-    agent_id = (os.environ.get("LYZR_AGENT_ID") or "").strip()
-    if not (api_key and agent_id):
-        return DEFAULT_PLAN, "deterministic"
+def store_memory(user_id: str, room_name: str, summary: str, actions: list[dict[str, Any]]) -> bool:
+    return _store_memory_payload(user_id, room_name, summary, {"kind": "checkin", "actions": actions})
+
+
+def store_performance_memory(
+    user_id: str,
+    room_name: str,
+    movement: str,
+    pose_metrics: dict[str, Any],
+    analysis: dict[str, Any],
+    adaptation: dict[str, Any] | None,
+) -> bool:
+    reps = int(pose_metrics.get("reps") or 0)
+    score = int(analysis.get("score") or 0)
+    summary = (
+        f"{movement.replace('_', ' ')} set: {reps} verified reps, score {score}/100. "
+        f"{analysis.get('headline') or 'Set completed'}."
+    )
+    return _store_memory_payload(
+        user_id,
+        room_name,
+        summary,
+        {
+            "kind": "movement",
+            "movement": movement,
+            "pose_metrics": pose_metrics,
+            "analysis": analysis,
+            "adaptation": adaptation,
+        },
+    )
+
+
+def generate_plan(
+    answers: list[dict[str, str]],
+    memories: list[dict[str, Any]],
+    *,
+    session_id: str,
+    user_id: str,
+) -> tuple[list[dict[str, str]], str]:
     prompt = (
-        "Create exactly three concise, safe actions for a student athlete's day. "
-        "Return only a JSON array with id, eyebrow, title, and detail. Avoid diagnosis or financial advice.\n"
+        "You are the GameDay Performance Director. Create exactly three concise, safe actions for a student "
+        "athlete's day. Use relevant memory only when it changes a recommendation. Return only a JSON object "
+        "with an actions array containing id, eyebrow, title, and detail. Avoid diagnosis or financial advice.\n"
         f"Answers: {json.dumps(answers)}\nMemories: {json.dumps(memories[:3])}"
     )
-    try:
-        with httpx.Client(timeout=20.0) as client:
-            response = client.post(
-                "https://agent-prod.studio.lyzr.ai/v3/inference/chat/",
-                headers={"x-api-key": api_key, "Content-Type": "application/json"},
-                json={
-                    "user_id": os.environ.get("INSFORGE_PROFILE_ID", "gameday-demo"),
-                    "agent_id": agent_id,
-                    "session_id": f"gameday-{uuid4().hex}",
-                    "message": prompt,
-                },
-            )
-            response.raise_for_status()
-            body = response.json()
-            raw = body.get("response") or body.get("message") or body.get("content") or body
-            if isinstance(raw, str):
-                match = re.search(r"\[[\s\S]*\]", raw)
-                parsed = json.loads(match.group(0) if match else raw)
-            else:
-                parsed = raw
-            if isinstance(parsed, list) and len(parsed) == 3:
-                return [{str(key): str(value) for key, value in item.items()} for item in parsed], "lyzr"
-    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
-        pass
+    parsed, _ = invoke_json(
+        "plan",
+        prompt,
+        session_id=session_id,
+        user_id=user_id,
+        memory_used=bool(memories),
+    )
+    if isinstance(parsed, dict):
+        parsed = parsed.get("actions")
+    if isinstance(parsed, list) and len(parsed) == 3 and all(isinstance(item, dict) for item in parsed):
+        required = {"id", "eyebrow", "title", "detail"}
+        if all(required.issubset(item) for item in parsed):
+            return [{str(key): str(value) for key, value in item.items()} for item in parsed], "lyzr"
     return DEFAULT_PLAN, "deterministic"
 
 

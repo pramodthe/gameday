@@ -26,9 +26,10 @@ GameDay Mirror compresses that workflow into a guided two-minute interaction ava
 2. **Conducts a voice check-in.** An ElevenLabs voice agent asks concise questions about sleep, training load, fuel, mindset, and spending habits.
 3. **Builds structured readiness context.** Answers update recovery, training, fuel, and mindset cards instead of remaining as unstructured chat.
 4. **Recalls previous sessions.** Qdrant can retrieve relevant athlete memories so the coach responds with continuity.
-5. **Analyzes movement.** MediaPipe tracks pose landmarks locally while the athlete performs squats. OpenAI Realtime reviews a selected frame together with measured depth, symmetry, and torso control.
-6. **Creates a daily plan.** The Lyzr planning agent combines the athlete's answers, history, and movement result into concise recommendations.
-7. **Validates and stores the result.** Enkrypt AI can screen generated output, while InsForge persists profiles, answers, metrics, plans, and movement analyses.
+5. **Teaches any exercise visually.** The athlete says “teach me a reverse lunge,” Nova calls `teach_exercise`, and OpenAI generates a typed lesson rendered as a safe animated HTML/SVG movement card with steps, cues, mistakes, tempo, and safety guidance.
+6. **Runs camera-guided practice.** The athlete asks to practice a squat, push-up, lunge, plank, or glute bridge; Nova calls `start_exercise`, and MediaPipe returns verified progress and form context through LiveKit.
+7. **Creates and adapts the workout.** Lyzr combines readiness, Qdrant memory, and verified movement results to build the Core-5 workout and decide the safest next-set adjustment.
+8. **Validates and stores the result.** Enkrypt AI can screen generated output, while InsForge persists profiles, answers, metrics, plans, and movement analyses.
 
 When optional services are unavailable, deterministic fallbacks keep the demo functional instead of breaking the experience.
 
@@ -67,20 +68,25 @@ The same architecture can support football warm-up checks, basketball landing me
 
 | Agent | Technology | Responsibility |
 | --- | --- | --- |
-| **Voice Check-in Agent** | ElevenLabs Conversational AI | Speaks naturally, asks the daily questions, and produces conversational responses. |
-| **Realtime Session Bridge** | LiveKit Agents SDK + Python | Carries athlete audio to ElevenLabs and publishes transcripts and structured events back to the room. |
+| **Voice Check-in Agent** | ElevenLabs Conversational AI | Runs the check-in, chooses `teach_exercise` or `start_exercise`, and speaks from trusted UI and sensor updates. |
+| **Realtime Session Bridge** | LiveKit Agents SDK + Python | Carries audio plus AG-UI tool/state events, validates browser acknowledgements, and forwards accepted lesson or pose status to ElevenLabs. |
+| **Generative Lesson Agent** | OpenAI Responses API (`gpt-5.6-terra`) | Produces a strict exercise lesson schema that the UI turns into an animated movement playbook. |
 | **Movement Analysis Agent** | OpenAI Realtime (`gpt-realtime-2.1-mini`) | Reviews the camera frame and pose measurements, then returns a score and actionable form cues. |
-| **Daily Planning Agent** | Lyzr | Converts check-in context and memory into a concise training, recovery, fuel, and mindset plan. |
+| **Performance Director** | Lyzr Manager Agent | Dynamically routes readiness and workout requests to managed specialists. |
+| **Readiness Analyst** | Lyzr + Cognis memory | Converts six readiness signals and recalled athlete context into three actions for today. |
+| **Workout Architect** | Lyzr + Cognis memory | Programs a recovery-aware Core-5 session that the camera can verify. |
+| **Movement Adaptation Coach** | Lyzr SuperFlow + Cognis | Uses pose results and prior sets in a deterministic verified-set workflow. |
 | **Safety Validator** | Enkrypt AI | Provides a guardrail layer for unsafe, unsupported, or hallucinated recommendations. |
 
 ### Platform and Data Tools
 
 | Tool | Use in GameDay Mirror |
 | --- | --- |
-| **LiveKit** | Realtime room, camera, microphone, agent dispatch, audio, and data events. |
-| **MediaPipe Pose** | On-device body-landmark tracking and squat biomechanics. |
+| **LiveKit** | Realtime room, camera, microphone, agent dispatch, audio, exercise commands, and pose telemetry. |
+| **AG-UI protocol** | Correlated tool lifecycles and revisioned state snapshots over LiveKit data channels. |
+| **MediaPipe Pose** | On-device body-landmark tracking for squats, push-ups, lunges, planks, and glute bridges. |
 | **InsForge** | Athlete profiles, check-in sessions, answers, daily plans, and movement-analysis persistence. |
-| **Qdrant** | Semantic memory retrieval across previous athlete check-ins. |
+| **Qdrant** | Semantic retrieval across check-ins, workout decisions, and camera-verified movement results. |
 | **React + Vite** | Responsive mirror interface and realtime visual feedback. |
 | **FastAPI** | Secure token generation, orchestration endpoints, provider calls, and persistence APIs. |
 
@@ -90,8 +96,8 @@ GameDay Mirror was built for the [Sports World Cup Hackathon](https://luma.com/a
 
 The project demonstrates each featured ecosystem technology in a user-visible workflow:
 
-- **Lyzr:** powers the planning agent that turns multimodal athlete context into a daily action plan.
-- **Qdrant:** gives the agent long-term semantic memory instead of treating every check-in as a new conversation.
+- **Lyzr:** supplies a Manager Agent, three managed specialists, Cognis cross-session memory, Global Context, native RAI guardrails, strict JSON schemas, and a deterministic SuperFlow for every verified-set adaptation.
+- **Qdrant:** gives Lyzr searchable evidence from check-ins and camera-verified movement results instead of treating every session as new.
 - **Enkrypt AI:** adds a safety layer for generated sports recommendations.
 - **InsForge:** acts as the agent-native backend for profiles, sessions, answers, metrics, plans, and movement results.
 
@@ -118,7 +124,16 @@ flowchart LR
     Web --> Pose[MediaPipe Pose]
     Web <--> API[FastAPI Orchestrator]
     API --> Vision[OpenAI Realtime Vision]
-    API --> Planner[Lyzr Planning Agent]
+    API --> Lessons[OpenAI Structured Lessons]
+    API --> Director[Lyzr Performance Director]
+    Director --> Readiness[Lyzr Readiness Analyst]
+    Director --> Workout[Lyzr Workout Architect]
+    API --> Flow[Lyzr Verified-Set SuperFlow]
+    Flow --> Adaptation[Lyzr Adaptation Coach]
+    Director <--> Cognis[(Lyzr Cognis Memory)]
+    Readiness --> RAI[Lyzr RAI + Global Context]
+    Workout --> RAI
+    Adaptation --> RAI
     API --> Guard[Enkrypt Safety]
     API <--> Memory[(Qdrant Memory)]
     API <--> Backend[(InsForge Backend)]
@@ -128,7 +143,10 @@ flowchart LR
 
 ```text
 Join room -> load athlete context -> voice questions -> structured answers
-          -> pose tracking -> visual analysis -> plan generation
+          -> AG-UI tool call -> acknowledged browser state snapshot
+          -> generated visual lesson or auto-start pose tracking
+          -> lesson cues or verified rep context
+          -> visual analysis -> plan generation
           -> safety validation -> persistence -> final coaching card
 ```
 
@@ -175,14 +193,33 @@ Add only the providers you want to enable to `.env`:
 | --- | --- |
 | Live rooms | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` |
 | Voice coach | `ELEVENLABS_API_KEY`, `ELEVENLABS_AGENT_ID` |
-| Visual analysis | `OPENAI_API_KEY`; optional `OPENAI_REALTIME_MODEL` |
+| Visual lessons and analysis | `OPENAI_API_KEY`; optional `OPENAI_LESSON_MODEL` and `OPENAI_REALTIME_MODEL` |
 | InsForge REST | `INSFORGE_URL`, `INSFORGE_API_KEY`, `INSFORGE_PROFILE_ID` |
 | Direct Postgres | `INSFORGE_DATABASE_URL`, `INSFORGE_PROFILE_ID` |
 | Semantic memory | `QDRANT_URL`, `QDRANT_API_KEY` |
-| Plan generation | `LYZR_API_KEY`, `LYZR_AGENT_ID` |
+| Lyzr agent team | `LYZR_API_KEY`, manager and specialist IDs, `LYZR_CONTEXT_ID`, `LYZR_RAI_POLICY_ID`, `LYZR_SUPERFLOW_ID` |
 | Safety validation | `ENKRYPTAI_API_KEY` |
 
 Never expose provider secrets through `VITE_*` variables or commit `.env`.
+
+Create or update the four Lyzr dashboard agents. This configures managed-agent links, Cognis cross-session memory, Global Context, RAI policy enforcement, and strict Pydantic-derived output schemas:
+
+```bash
+.venv/bin/python scripts/configure_lyzr_agents.py
+.venv/bin/python scripts/configure_lyzr_superflow.py
+```
+
+The Performance Director handles dynamic conversational routing. The saved **GameDay Verified-Set Adaptation** SuperFlow handles the deterministic post-set path through Lyzr's DAG runner and returns a task ID recorded in application telemetry. `LYZR_REFLECTION_ENABLED=true` enables slower SRS reflection for readiness plans only; keep it disabled during the live demo.
+
+An optional custom OpenAPI connection can read recent InsForge sessions and movement scores. Deploy and register it with:
+
+```bash
+npx @insforge/cli functions deploy gameday-agent-context \
+  --file functions/gameday-agent-context.ts
+.venv/bin/python scripts/configure_lyzr_tools.py
+```
+
+The tool is provisioned separately from runtime prompts. Enable `LYZR_CONTEXT_TOOL_ENABLED=true` only after its Lyzr executor smoke test passes, then rerun `configure_lyzr_agents.py`. The production path already supplies scoped Qdrant evidence and remains safe if any tool call fails.
 
 ### Start the Voice Worker
 
@@ -193,6 +230,14 @@ npm run dev:agent
 ```
 
 The bridge supplies `athlete_name`, `recent_memory`, and `session_id` to the ElevenLabs agent as dynamic variables.
+
+Exercise UI synchronization uses an [AG-UI](https://docs.ag-ui.com/) compatible event subset over LiveKit. The bridge emits `TOOL_CALL_START`, `TOOL_CALL_ARGS`, `TOOL_CALL_END`, and monotonic `STATE_SNAPSHOT` events. The browser replies with `CUSTOM` telemetry carrying the same tool-call ID; stale IDs are ignored, and ElevenLabs receives a tool result only after the browser acknowledges the requested UI.
+
+Register both exercise client tools and their routing rules on the configured ElevenLabs agent:
+
+```bash
+.venv/bin/python scripts/configure_elevenlabs_agent.py
+```
 
 ### Configure InsForge
 
@@ -232,7 +277,7 @@ npx @insforge/cli compute list
 
 ## Current Scope and Safety
 
-The current MVP supports a four-question daily check-in and squat analysis. It is a sports coaching aid, not a medical device. It must not diagnose injuries, prescribe treatment, or replace a qualified coach or clinician.
+The current MVP supports a six-dimension adaptive check-in, generated visual lessons for named exercises, and camera analysis for the Core-5 movement library. It is a sports coaching aid, not a medical device. It must not diagnose injuries, prescribe treatment, or replace a qualified coach or clinician.
 
 MediaPipe landmark tracking runs in the browser. Visual analysis sends one selected camera frame and derived movement measurements to the configured OpenAI model. Production deployments should add user consent, retention controls, authentication, and organization-specific access policies.
 

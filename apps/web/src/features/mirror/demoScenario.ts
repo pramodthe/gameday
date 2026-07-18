@@ -1,4 +1,4 @@
-import type { DemoQuestion, MirrorMetric, PlanAction } from './types';
+import type { DemoQuestion, MirrorMetric, PlanAction, WorkoutSession } from './types';
 
 export const INITIAL_METRICS: MirrorMetric[] = [
   { key: 'sleep', label: 'Sleep', value: '— hrs', detail: 'Waiting for check-in', tone: 'neutral' },
@@ -51,6 +51,20 @@ export const DAILY_PLAN: PlanAction[] = [
   { id: 'recover', eyebrow: 'Before practice', title: 'Protect the evening session', detail: 'Take a 20-minute recovery reset instead of adding extra training volume.' },
   { id: 'spend', eyebrow: 'Off field', title: 'Hold the $15 line', detail: 'Use the meal already available and keep dining spend under today’s target.' },
 ];
+
+export const DEMO_WORKOUT: WorkoutSession = {
+  title: 'Recovery reset',
+  focus: 'Mobility and low-impact activation',
+  intensity: 'recovery',
+  estimated_minutes: 12,
+  summary: 'A light, joint-friendly session that protects a short-sleep day while still moving well.',
+  source: 'demo',
+  exercises: [
+    { name: 'Glute Bridge', motion_pattern: 'glute_bridge', sets: 2, reps: 12, hold_seconds: 0, rest_seconds: 45, coaching_cue: 'Squeeze your glutes at the top; keep it smooth.' },
+    { name: 'Forearm Plank', motion_pattern: 'plank', sets: 2, reps: 0, hold_seconds: 20, rest_seconds: 45, coaching_cue: 'Hold a straight line and breathe steadily.' },
+    { name: 'Reverse Lunge', motion_pattern: 'lunge', sets: 2, reps: 8, hold_seconds: 0, rest_seconds: 45, coaching_cue: 'Stay tall and move with control, no rushing.' },
+  ],
+};
 
 export const MEMORY_TEXT =
   'Yesterday you planned another intense session after only 4.5 hours of sleep. Today’s plan reduces extra load instead of repeating it.';
